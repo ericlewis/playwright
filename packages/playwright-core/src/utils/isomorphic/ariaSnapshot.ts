@@ -258,7 +258,20 @@ function normalizeWhitespace(text: string) {
 }
 
 export function valueOrRegex(value: string): string | AriaRegex {
-  return value.startsWith('/') && value.endsWith('/') && value.length > 1 ? { pattern: value.slice(1, -1) } : normalizeWhitespace(value);
+  // Handle quoted regex patterns like "/pattern/"
+  if (value.startsWith('"') && value.endsWith('"') && value.length > 2) {
+    const unquoted = value.slice(1, -1);
+    if (unquoted.startsWith('/') && unquoted.endsWith('/') && unquoted.length > 1) {
+      return { pattern: unquoted.slice(1, -1) };
+    }
+  }
+  
+  // Handle unquoted regex patterns like /pattern/
+  if (value.startsWith('/') && value.endsWith('/') && value.length > 1) {
+    return { pattern: value.slice(1, -1) };
+  }
+  
+  return normalizeWhitespace(value);
 }
 
 export class KeyParser {
@@ -374,7 +387,12 @@ export class KeyParser {
     const ch = this._peek();
     if (ch === '"') {
       this._next();
-      return normalizeWhitespace(this._readString());
+      const str = this._readString();
+      // Check if the quoted string is a regex pattern like "/pattern/"
+      if (str.startsWith('/') && str.endsWith('/') && str.length > 1) {
+        return { pattern: str.slice(1, -1) };
+      }
+      return normalizeWhitespace(str);
     }
 
     if (ch === '/') {

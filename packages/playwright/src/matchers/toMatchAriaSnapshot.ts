@@ -89,14 +89,34 @@ export async function toMatchAriaSnapshot(
   }
 
   expected = unshift(expected);
-  const { matches: pass, received, log, timedOut } = await receiver._expect('to.match.aria', { expectedValue: expected, isNot: this.isNot, timeout });
-  const typedReceived = received as MatcherReceived | typeof kNoElementsFoundError;
-
+  
+  // Preprocess YAML to automatically quote strings that need it
+  expected = preprocessYaml(expected);
+  
+  let pass: boolean;
+  let received: any;
+  let log: string[] | undefined;
+  let timedOut: boolean | undefined;
+  
+  try {
+    const result = await receiver._expect('to.match.aria', { expectedValue: expected, isNot: this.isNot, timeout });
+    pass = result.matches;
+    received = result.received;
+    log = result.log;
+    timedOut = result.timedOut;
+  } catch (error: any) {
+    // Re-throw the error with a more helpful message if it's a YAML parsing error
+    if (error.message && error.message.includes('Nested mappings are not allowed')) {
+      throw new Error(`YAML syntax error in aria snapshot: ${error.message}\n\nHint: Strings containing colons need to be quoted, e.g., "Items: 42"`);
+    }
+    throw error;
+  }
+  
   const matcherHintWithExpect = (expectedReceivedString: string) => {
     return matcherHint(this, receiver, matcherName, 'locator', undefined, matcherOptions, timedOut ? timeout : undefined, expectedReceivedString);
   };
 
-  const notFound = typedReceived === kNoElementsFoundError;
+  const notFound = received === kNoElementsFoundError;
   if (notFound) {
     return {
       pass: this.isNot,
@@ -106,15 +126,24 @@ export async function toMatchAriaSnapshot(
     };
   }
 
-  const receivedText = typedReceived.raw;
+  // Type guard to ensure received is MatcherReceived after notFound check
+  const typedReceived = received as MatcherReceived;
+  let receivedText: string;
+
+  // Decide which representation of the received snapshot to use in diff. If the assertion passes we
+  // can show the raw (pretty-printed) aria tree. If it fails, prefer the regex (best-guess) form so
+  // that dynamic portions that are intentionally matched via regular expressions are not highlighted
+  // as differences, addressing the confusion reported in issue #34555.
+  receivedText = pass ? typedReceived.raw : typedReceived.regex;
+  
   const message = () => {
     if (pass) {
-      const receivedString = notFound ? receivedText : printReceivedStringContainExpectedSubstring(receivedText, receivedText.indexOf(expected), expected.length);
+      const receivedString = printReceivedStringContainExpectedSubstring(receivedText, receivedText.indexOf(expected), expected.length);
       const expectedReceivedString = `Expected: not ${this.utils.printExpected(expected)}\nReceived: ${receivedString}`;
       return matcherHintWithExpect(expectedReceivedString) + callLogText(log);
     } else {
       const labelExpected = `Expected`;
-      const expectedReceivedString = notFound ? `${labelExpected}: ${this.utils.printExpected(expected)}\nReceived: ${receivedText}` : this.utils.printDiffOrStringify(expected, receivedText, labelExpected, 'Received', false);
+      const expectedReceivedString = this.utils.printDiffOrStringify(expected, receivedText, labelExpected, 'Received', false);
       return matcherHintWithExpect(expectedReceivedString) + callLogText(log);
     }
   };
@@ -165,15 +194,105 @@ export async function toMatchAriaSnapshot(
 
 function unshift(snapshot: string): string {
   const lines = snapshot.split('\n');
-  let whitespacePrefixLength = 100;
+  let whitePrefix: string | null = null;
   for (const line of lines) {
-    if (!line.trim())
-      continue;
-    const match = line.match(/^(\s*)/);
-    if (match && match[1].length < whitespacePrefixLength)
-      whitespacePrefixLength = match[1].length;
+    const trimmed = line.trim();
+    if (trimmed && whitePrefix === null) {
+      whitePrefix = line.substring(0, line.length - trimmed.length);
+      break;
+    }
   }
-  return lines.filter(t => t.trim()).map(line => line.substring(whitespacePrefixLength)).join('\n');
+  return lines.filter(t => t.trim()).map(line => line.substring(whitePrefix!.length)).join('\n');
+}
+
+/**
+ * Preprocesses YAML to automatically quote strings that need it.
+ * This makes the YAML syntax more forgiving for common patterns.
+ */
+function preprocessYaml(yaml: string): string {
+  const lines = yaml.split('\n');
+  const processed: string[] = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    // Skip empty lines and comments
+    if (!line.trim() || line.trim().startsWith('#')) {
+      processed.push(line);
+      continue;
+    }
+    
+    // Match list items with potential unquoted values
+    const listMatch = line.match(/^(\s*)-\s+(.+)$/);
+    if (listMatch) {
+      const [, indent, content] = listMatch;
+      
+      // Check if it's a role/element with children (ends with colon)
+      if (content.endsWith(':')) {
+        // Don't quote role names with children
+        processed.push(line);
+        continue;
+      }
+      
+      // Check if it's a property syntax (starts with /)
+      if (content.startsWith('/')) {
+        // Don't quote property syntax like /url: ...
+        processed.push(line);
+        continue;
+      }
+      
+      // Check if it's a key-value pair (e.g., "paragraph: Items: 42")
+      const keyValueMatch = content.match(/^(\w+):\s*(.+)$/);
+      if (keyValueMatch) {
+        const [, key, value] = keyValueMatch;
+        
+        // Don't process if it's already a quoted regex pattern
+        if (value.match(/^"\/.*\/"$/)) {
+          processed.push(line);
+          continue;
+        }
+        
+        // Check if the value needs quoting
+        if (needsYamlQuoting(value)) {
+          processed.push(`${indent}- ${key}: "${escapeYamlString(value)}"`);
+        } else {
+          processed.push(line);
+        }
+      } else {
+        // It's just a list item value, check if it needs quoting
+        if (needsYamlQuoting(content)) {
+          processed.push(`${indent}- "${escapeYamlString(content)}"`);
+        } else {
+          processed.push(line);
+        }
+      }
+    } else {
+      processed.push(line);
+    }
+  }
+  
+  return processed.join('\n');
+}
+
+function needsYamlQuoting(str: string): boolean {
+  // Strings that contain colon followed by space are problematic in YAML
+  if (str.includes(': '))
+    return true;
+  
+  // Also quote strings with percent signs as they can cause issues
+  if (str.includes('%'))
+    return true;
+    
+  return false;
+}
+
+function escapeYamlString(str: string): string {
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
 }
 
 function indent(snapshot: string, indent: string): string {
